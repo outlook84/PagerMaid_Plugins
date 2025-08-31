@@ -60,7 +60,7 @@ class HisMsg:
     def __init__(self):
         try:
             self.lang_dict = self.LANGUAGES[Config.LANGUAGE]
-        except:
+        except Exception:
             self.lang_dict = self.LANGUAGES["en"]
 
     def lang(self, text: str, default: str = "") -> str:
