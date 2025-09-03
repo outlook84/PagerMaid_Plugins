@@ -11,6 +11,7 @@ from pagermaid.enums import Message
 from pagermaid.listener import listener
 from pagermaid.services import sqlite as db
 from pagermaid.utils import alias_command, pip_install
+from pagermaid.utils.bot_utils import log
 
 from PIL import Image
 from telethon.errors import MessageTooLongError, MessageEmptyError
@@ -234,9 +235,11 @@ async def _handle_gemini_exception(message: Message, e: Exception, api_name: str
     """Handles common exceptions from the Gemini API."""
     error_str = str(e)
     if "429" in error_str and "ResourceExhausted" in error_str:
-        await message.edit(f"<b>调用 {api_name} 已达到速率限制。</b>\n<pre><code>{html.escape(error_str)}</code></pre>", parse_mode='html')
+        await message.edit(f"<b>调用 {api_name} 已达到速率限制。</b>", parse_mode='html')
+        await log(f"调用 {api_name} 时出错: {error_str}")
     else:
-        await message.edit(f"调用 {api_name} 时出错:\n<pre><code>{html.escape(error_str)}</code></pre>", parse_mode='html')
+        await message.edit(f"调用 {api_name} 时出错，详细错误信息已输出到日志。", parse_mode='html')
+        await log(f"调用 {api_name} 时出错: {error_str}")
 
 
 async def _get_gemini_client(message: Message) -> genai.Client | None:
@@ -739,11 +742,24 @@ async def _telegraph_clear(message: Message, _):
 
 
 async def _handle_telegraph(message: Message, args: str):
+    """
+    Handles all telegraph sub-commands.
+    """
     parts = args.split(maxsplit=1)
     action = parts[0] if parts else None
     action_args = parts[1] if len(parts) > 1 else ""
-    actions = {"on": _telegraph_toggle, "off": _telegraph_toggle, "limit": _telegraph_limit,
-               "list": _telegraph_list, "del": _telegraph_del, "clear": _telegraph_clear}
+
+    if action == "on" or action == "off":
+        await _telegraph_toggle(message, action)
+        return
+
+    actions = {
+        "limit": _telegraph_limit,
+        "list": _telegraph_list,
+        "del": _telegraph_del,
+        "clear": _telegraph_clear
+    }
+
     if action in actions:
         await actions[action](message, action_args)
     else:
