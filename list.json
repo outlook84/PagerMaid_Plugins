@@ -111,6 +111,16 @@
             "des": "crazy4 天天疯狂！随机输出KFC疯狂星期四文案"
         },
         {
+            "name": "cron",
+            "version": "0.10",
+            "section": "chat",
+            "maintainer": "outlook84",
+            "size": "11.0 kb",
+            "supported": true,
+            "des_short": "定时发送用户自定义消息/命令插件。",
+            "des": "## Cron\n\n定时发送用户自定义消息/命令插件。支持标准 cron 表达式、执行次数限制。\n**账户被限制/封禁风险自负。**\n\n任务管理:\n- `cron add <分> <时> <日> <月> <周> <chat_id> [n<次数>] <内容>`: 添加定时任务。\n- `cron list`: 列出所有定时任务及执行状态。\n- `cron del <任务ID>`: 删除指定定时任务。\n- `cron clear`: 清空所有定时任务。\n- `cron help`: 显示帮助信息。\n\n参数说明:\n- cron 表达式为标准 5 段格式：`分 时 日 月 周`，如 `0 8 * * *` 表示每天 8:00。\n- `chat_id` 可以是数字 ID 或 `me`（收藏夹）。\n- 可选 `n<次数>` 指定执行次数，达到后任务自动删除。不指定则永久执行。\n\n示例:\n- `cron add 0 8 * * * me 早上好！`: 每天 8:00 向收藏夹发送\"早上好！\"。\n- `cron add */30 * * * * -100123456 -help`: 每 30 分钟在指定群组执行 help 命令。\n- `cron add 0 9 * * 1-5 me n5 -help`: 每个工作日 9:00 执行 help 命令，执行 5 次后任务自毁。"
+        },
+        {
             "name": "da",
             "version": "1.03",
             "section": "chat",
