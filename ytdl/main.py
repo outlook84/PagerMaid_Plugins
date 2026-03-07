@@ -136,7 +136,7 @@ def _ytdl_search(
     return results[:limit]
 
 
-def _format_search_results(keyword: str, results: list[dict], is_audio: bool) -> str:
+def _format_search_results(keyword: str, results: list[dict]) -> str:
     lines = [
         f"搜索结果: <code>{html.escape(keyword)}</code>",
         "",
@@ -164,12 +164,18 @@ def _get_search_cache() -> dict:
         return {}
 
     now = int(time.time())
-    cleaned = {
-        key: value
-        for key, value in data.items()
-        if isinstance(value, dict)
-        and now - int(value.get("updated_at", 0)) <= SEARCH_CACHE_TTL_SECONDS
-    }
+    cleaned = {}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        updated_at = value.get("updated_at", 0)
+        if not isinstance(updated_at, int):
+            try:
+                updated_at = int(updated_at)
+            except (TypeError, ValueError):
+                continue
+        if now - updated_at <= SEARCH_CACHE_TTL_SECONDS:
+            cleaned[key] = value
     if cleaned != data:
         db[SEARCH_CACHE_KEY] = cleaned
     return cleaned
@@ -189,10 +195,10 @@ async def _resolve_cached_result(message: Message, target: str) -> str | None:
     index = int(target) - 1
     if not results:
         await message.edit("当前会话没有可用的搜索缓存，请先使用关键词搜索。")
-        return ""
+        return None
     if index < 0 or index >= len(results):
         await message.edit(f"序号超出范围，请输入 1 到 {len(results)}。")
-        return ""
+        return None
     return results[index]["url"]
 
 
@@ -502,10 +508,8 @@ async def ytdl(message: Message, client: AsyncClient):
 
     if _should_use_cached_index(target, cache, message.chat_id):
         resolved_url = await _resolve_cached_result(message, target)
-        if resolved_url == "":
-            return
         if resolved_url is None:
-            return await message.edit("请输入链接、关键词，或使用 `ytdl 序号` 选择结果。", parse_mode="markdown")
+            return
         message.arguments = resolved_url
     elif _looks_like_url(target):
         message.arguments = target
@@ -529,7 +533,7 @@ async def ytdl(message: Message, client: AsyncClient):
         }
         _save_search_cache(cache)
         await message.edit(
-            _format_search_results(target, results, is_audio),
+            _format_search_results(target, results),
             parse_mode="html",
             link_preview=False,
         )
