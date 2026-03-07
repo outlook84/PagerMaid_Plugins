@@ -6,6 +6,7 @@ import re
 import importlib
 import os
 import asyncio
+from urllib.parse import urlparse
 
 from pagermaid.enums import Message
 from pagermaid.listener import listener
@@ -148,10 +149,19 @@ def _format_text_for_telegram(text: str) -> str:
     """
     raw_html = markdown.markdown(text, extensions=['fenced_code'])
     soup = BeautifulSoup(raw_html, "html.parser")
+    block_container_tags = {'ul', 'ol', 'blockquote'}
+
+    def _should_skip_whitespace_text(node) -> bool:
+        return getattr(node.parent, 'name', None) in block_container_tags and not str(node).strip()
+
+    def _is_list_item_paragraph(node) -> bool:
+        return getattr(node.parent, 'name', None) == 'li'
 
     def _convert(node) -> str:
         # Plain text node
         if node.name is None:
+            if _should_skip_whitespace_text(node):
+                return ""
             return html.escape(str(node))
 
         tag = node.name
@@ -167,7 +177,7 @@ def _format_text_for_telegram(text: str) -> str:
                         lang = cls[len('language-'):]
                         break
             inner_tag = f'<code class="{html.escape(lang)}">' if lang else '<code>'
-            return f'<pre>{inner_tag}{code_text}</code></pre>\n'
+            return f'<pre>{inner_tag}{code_text}</code></pre>'
 
         inner = "".join(_convert(child) for child in node.children)
 
@@ -184,7 +194,9 @@ def _format_text_for_telegram(text: str) -> str:
         if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             return f"<b>{inner}</b>\n"
         if tag == 'p':
-            return f"{inner}\n\n"
+            if _is_list_item_paragraph(node):
+                return inner
+            return f"{inner}\n"
         if tag == 'br':
             return "\n"
         if tag == 'hr':
@@ -197,7 +209,7 @@ def _format_text_for_telegram(text: str) -> str:
         if tag == 'li':
             return f"• {inner.strip()}\n"
         if tag == 'blockquote':
-            return f"<blockquote>{inner}</blockquote>\n"
+            return f"<blockquote>{inner}</blockquote>"
         # Any unrecognised tag: just emit the inner content
         return inner
 
@@ -327,11 +339,167 @@ def _extract_response_text(response) -> str:
     return "\n".join(text_segments) if text_segments else (response.text or "")
 
 
-async def _call_gemini_api(message: Message, contents: list, use_search: bool) -> str | None:
-    """Calls the Gemini API in a non-blocking way and returns the response text, or None on error."""
+def _normalize_text_for_match(text: str) -> str:
+    """Normalizes text for fuzzy paragraph matching."""
+    return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def _extract_search_sources(response) -> list[dict]:
+    """Extracts deduplicated source entries from Gemini grounding metadata."""
+    try:
+        metadata = response.candidates[0].grounding_metadata
+    except (IndexError, AttributeError):
+        return []
+
+    sources = []
+    seen_urls = set()
+    for chunk in getattr(metadata, 'grounding_chunks', []) or []:
+        web = getattr(chunk, 'web', None)
+        url = getattr(web, 'uri', None) or getattr(chunk, 'uri', None)
+        title = getattr(web, 'title', None) or getattr(chunk, 'title', None) or url
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        sources.append({"title": title or url, "url": url})
+    return sources
+
+
+def _format_search_sources(sources: list[dict]) -> str:
+    """Formats source entries into a readable footer."""
+    if not sources:
+        return ""
+    lines = ["来源:"]
+    for index, source in enumerate(sources, start=1):
+        domain = urlparse(source["url"]).netloc or source["url"]
+        lines.append(f"[{index}] [{domain}]({source['url']})")
+    return "\n".join(lines)
+
+
+def _annotate_search_text_with_supports(text: str, response, sources: list[dict]) -> str:
+    """Appends citation markers to paragraphs using grounding support order."""
+    if not text or not sources:
+        return text
+
+    try:
+        metadata = response.candidates[0].grounding_metadata
+    except (IndexError, AttributeError):
+        return text
+
+    source_index_by_url = {source["url"]: i + 1 for i, source in enumerate(sources)}
+    chunk_source_numbers = []
+    for chunk in getattr(metadata, 'grounding_chunks', []) or []:
+        web = getattr(chunk, 'web', None)
+        url = getattr(web, 'uri', None) or getattr(chunk, 'uri', None)
+        chunk_source_numbers.append(source_index_by_url.get(url))
+
+    paragraphs = text.split("\n\n")
+    paragraph_infos = []
+    for paragraph in paragraphs:
+        paragraph_infos.append({
+            "text": paragraph,
+            "normalized": _normalize_text_for_match(paragraph),
+            "citations": []
+        })
+
+    non_empty_indices = [i for i, info in enumerate(paragraph_infos) if info["normalized"]]
+    if not non_empty_indices:
+        return text
+
+    next_fallback_pos = 0
+    last_match_pos = 0
+    supports = getattr(metadata, 'grounding_supports', []) or []
+    for support in supports:
+        indices = getattr(support, 'grounding_chunk_indices', None) or []
+        citation_numbers = []
+        for chunk_index in indices:
+            if 0 <= chunk_index < len(chunk_source_numbers):
+                number = chunk_source_numbers[chunk_index]
+                if number and number not in citation_numbers:
+                    citation_numbers.append(number)
+        if not citation_numbers:
+            continue
+
+        target_index = None
+        segment = getattr(support, 'segment', None)
+        segment_text = _normalize_text_for_match(getattr(segment, 'text', None))
+        if segment_text:
+            for pos in range(last_match_pos, len(non_empty_indices)):
+                paragraph_index = non_empty_indices[pos]
+                if segment_text in paragraph_infos[paragraph_index]["normalized"]:
+                    target_index = paragraph_index
+                    last_match_pos = pos
+                    break
+            if target_index is None:
+                for pos in range(0, last_match_pos):
+                    paragraph_index = non_empty_indices[pos]
+                    if segment_text in paragraph_infos[paragraph_index]["normalized"]:
+                        target_index = paragraph_index
+                        last_match_pos = pos
+                        break
+
+        if target_index is None:
+            fallback_pos = min(next_fallback_pos, len(non_empty_indices) - 1)
+            target_index = non_empty_indices[fallback_pos]
+            next_fallback_pos = min(fallback_pos + 1, len(non_empty_indices) - 1)
+
+        citations = paragraph_infos[target_index]["citations"]
+        for number in citation_numbers:
+            if number not in citations:
+                citations.append(number)
+
+    for info in paragraph_infos:
+        if info["citations"] and info["text"].strip():
+            markers = "".join(f"[{number}]" for number in info["citations"])
+            info["text"] = f"{info['text'].rstrip()} {markers}"
+
+    return "\n\n".join(info["text"] for info in paragraph_infos).strip()
+
+
+def _normalize_block_spacing_in_html(html_output: str) -> str:
+    """Removes extra blank lines around block tags before Telegram entity parsing."""
+    html_output = re.sub(r'\n+(?=<(?:blockquote|pre)\b)', '\n', html_output)
+    html_output = re.sub(r'(</(?:blockquote|pre)>)\n+', r'\1\n', html_output)
+    return html_output
+
+
+def _extract_code_response_text(response) -> str:
+    """Formats code execution responses, including generated code and runtime output."""
+    try:
+        parts = response.candidates[0].content.parts
+    except (IndexError, AttributeError):
+        return response.text or ""
+
+    rendered_parts = []
+    for part in parts:
+        if getattr(part, 'thought', False):
+            continue
+        if getattr(part, 'text', None):
+            rendered_parts.append(part.text)
+        if getattr(part, 'executable_code', None) and getattr(part.executable_code, 'code', None):
+            language = (getattr(part.executable_code, 'language', None) or "python").lower()
+            rendered_parts.append(f"生成代码:\n```{language}\n{part.executable_code.code.strip()}\n```")
+        if getattr(part, 'code_execution_result', None):
+            output = getattr(part.code_execution_result, 'output', '')
+            if output:
+                rendered_parts.append(f"执行输出:\n```text\n{output.strip()}\n```")
+    return "\n".join(part for part in rendered_parts if part).strip() or (response.text or "")
+
+
+def _build_gemini_tools(use_search: bool, use_code: bool) -> list:
+    """Builds the tool list for a Gemini request."""
+    if use_code:
+        return [types.Tool(code_execution=types.ToolCodeExecution)]
+    if use_search:
+        return [types.Tool(google_search=types.GoogleSearch(), url_context=types.UrlContext())]
+    return [types.Tool(url_context=types.UrlContext())]
+
+
+async def _call_gemini_api(message: Message, contents: list, use_search: bool,
+                           use_code: bool = False) -> tuple[str, str, list[dict]]:
+    """Calls the Gemini API and returns plain text, cited text, and optional source metadata."""
     client = await _get_gemini_client(message)
     if not client:
-        return None
+        return "", "", []
 
     model_name = db.get(Config.SEARCH_MODEL if use_search else Config.CHAT_MODEL,
                         Config.DEFAULT_SEARCH_MODEL if use_search else Config.DEFAULT_CHAT_MODEL)
@@ -347,16 +515,11 @@ async def _call_gemini_api(message: Message, contents: list, use_search: bool) -
                             'HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
                             'HARM_CATEGORY_CIVIC_INTEGRITY']]
         max_tokens = db.get(Config.MAX_TOKENS, 0)
-        tools = [
-            types.Tool(google_search=types.GoogleSearch(), url_context=types.UrlContext())
-        ] if use_search else [
-            types.Tool(url_context=types.UrlContext())
-        ]
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             safety_settings=safety_settings,
             max_output_tokens=max_tokens if max_tokens > 0 else None,
-            tools=tools,
+            tools=_build_gemini_tools(use_search, use_code),
         )
         return client.models.generate_content(model=f"models/{model_name}", contents=api_contents, config=config)
 
@@ -364,15 +527,23 @@ async def _call_gemini_api(message: Message, contents: list, use_search: bool) -
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(None, blocking_api_call)
 
-        display_text = _extract_response_text(response)
+        sources = _extract_search_sources(response) if use_search else []
+        if use_code:
+            plain_text = _extract_code_response_text(response)
+            cited_text = plain_text
+        else:
+            plain_text = _extract_response_text(response)
+            cited_text = plain_text
+            if use_search:
+                cited_text = _annotate_search_text_with_supports(plain_text, response, sources)
         if db.get(Config.CONTEXT_ENABLED) and not use_search:
             history = db.get(Config.CHAT_HISTORY, [])
-            history.extend([contents[0], display_text])
+            history.extend([contents[0], plain_text])
             db[Config.CHAT_HISTORY] = history
-        return display_text
+        return plain_text, cited_text, sources
     except Exception as e:
         await _handle_gemini_exception(message, e)
-        return None
+        return "", "", []
 
 
 async def _call_gemini_image_api(message: Message, contents: list) -> tuple[str | None, Image.Image | None]:
@@ -842,6 +1013,7 @@ def _build_response_message(prompt_text: str, html_output: str, powered_by: str)
     """
     final_text, entities = "", []
     collapsible = db.get(Config.COLLAPSIBLE_QUOTE_ENABLED, False)
+    html_output = _normalize_block_spacing_in_html(html_output)
     response_text_formatted, response_entities = tg_html.parse(html_output)
 
     if prompt_text:
@@ -875,8 +1047,6 @@ def _build_response_message(prompt_text: str, html_output: str, powered_by: str)
     final_response_entities.extend(e for e in response_entities if not isinstance(e, block_types))
     # 3. 也保留块级实体本身
     final_response_entities.extend(block_entities)
-    
-    last_offset = 0
     response_text_len = _get_utf16_length(response_text_formatted)
 
     # 4. 在块级实体的“间隙”中创建新的引用块
@@ -973,22 +1143,31 @@ async def _send_response(message: Message, prompt_text: str, html_output: str, p
             await _show_error(message, "输出过长。启用 Telegraph 集成以链接形式发送。")
 
 
-async def _execute_gemini_request(message: Message, args: str, use_search: bool):
+async def _execute_gemini_request(message: Message, args: str, use_search: bool, use_code: bool = False,
+                                  include_search_sources: bool = True):
     """Generic handler for chat and search requests."""
     edit_text = "🔍 正在搜索..." if use_search else "💬 思考中..."
-    powered_by = "Powered by Gemini with Google Search" if use_search else "Powered by Gemini"
+    if use_code:
+        powered_by = "Powered by Gemini with Code Execution"
+    else:
+        powered_by = "Powered by Gemini with Google Search" if use_search else "Powered by Gemini"
     await message.edit(edit_text, parse_mode='html')
 
     contents = await _get_full_content(message, args)
     if contents is None:
         return
     if not contents:
-        await _send_usage(message, "search" if use_search else "", "[query] or reply to a message.")
+        await _send_usage(message, "_code" if use_code else ("search" if use_search else ""), "[query] or reply to a message.")
         return
 
-    output_text = await _call_gemini_api(message, contents, use_search=use_search)
-    if output_text is None:
+    plain_text, cited_text, sources = await _call_gemini_api(message, contents, use_search=use_search, use_code=use_code)
+    if not plain_text:
         return
+
+    output_text = cited_text if use_search else plain_text
+    source_footer = _format_search_sources(sources) if use_search and include_search_sources else ""
+    if source_footer:
+        output_text = f"{output_text}\n\n{source_footer}"
 
     html_output = _format_text_for_telegram(output_text)
     prompt_text = await _get_prompt_text_for_display(message, args)
@@ -1001,6 +1180,10 @@ async def _handle_search(message: Message, args: str):
 
 async def _handle_chat(message: Message, args: str):
     await _execute_gemini_request(message, args, use_search=False)
+
+
+async def _handle_code(message: Message, args: str):
+    await _execute_gemini_request(message, args, use_search=False, use_code=True)
 
 
 async def _handle_image(message: Message, args: str):
@@ -1140,9 +1323,14 @@ async def _execute_audio_request(message: Message, args: str, use_search: bool):
         await _send_usage(message, "search_audio" if use_search else "_audio", "[query] or reply to a message.")
         return
 
-    output_text = await _call_gemini_api(message, contents, use_search=use_search)
-    if output_text is None:
+    plain_text, cited_text, sources = await _call_gemini_api(message, contents, use_search=use_search)
+    if not plain_text:
         return
+
+    fallback_text = cited_text if use_search else plain_text
+    source_footer = _format_search_sources(sources) if use_search else ""
+    if source_footer:
+        fallback_text = f"{fallback_text}\n\n{source_footer}"
 
     prompt_text = await _get_prompt_text_for_display(message, args)
     caption = ""
@@ -1152,7 +1340,7 @@ async def _execute_audio_request(message: Message, args: str, use_search: bool):
 
     fallback_reason = None
     try:
-        tts_result = await _generate_and_send_audio(message, output_text, caption_text=caption)
+        tts_result = await _generate_and_send_audio(message, plain_text, caption_text=caption)
     except ValueError as e:
         if str(e).startswith("TOKEN_LIMIT_EXCEEDED"):
             total_tokens = str(e).split(":")[1].strip()
@@ -1166,9 +1354,9 @@ async def _execute_audio_request(message: Message, args: str, use_search: bool):
     elif tts_result is False:
         fallback_message = fallback_reason or "语音生成失败。"
         await message.edit(f"{fallback_message} 将以文本形式发送回复。", parse_mode='html')
-        html_output = _format_text_for_telegram(output_text)
+        html_output = _format_text_for_telegram(fallback_text)
         prompt_text = await _get_prompt_text_for_display(message, args)
-        await _send_response(message, prompt_text, html_output, powered_by, raw_text=output_text)
+        await _send_response(message, prompt_text, html_output, powered_by, raw_text=fallback_text)
     # if tts_result is None, do nothing as the error is already displayed.
 
 
@@ -1187,6 +1375,7 @@ Google Gemini AI 插件。需要 PagerMaid-Modify 1.5.8 及以上版本。
 
 核心功能:
 - `gemini [query]`: 与模型聊天，自动读取消息中的 URL 内容。
+- `gemini _code [query]`: 启用 Gemini 代码执行器处理问题。
 - `gemini _audio [query]`: 获取模型回复并转换为语音。
 - `gemini search [query]`: 使用 Gemini AI 支持的 Google 搜索 + URL 读取。
 - `gemini search_audio [query]`: 获取搜索结果并转换为语音。
@@ -1204,6 +1393,7 @@ Google Gemini AI 插件。需要 PagerMaid-Modify 1.5.8 及以上版本。
 模型管理:
 - `gemini model list`: 列出可用模型。
 - `gemini model set [chat|search|image|tts] [name]`: 设置聊天、搜索、图片或 TTS 模型。
+- `chat` 模型同时用于默认聊天和 `_code` 子命令。
 
 提示词管理:
 - `gemini prompt list`: 列出所有已保存的系统提示。
@@ -1239,6 +1429,7 @@ async def gemini(message: Message):
         "tts": _handle_tts, "image": _handle_image,
         "context": _handle_context, "telegraph": _handle_telegraph,
         "collapse": _handle_collapse, "_audio": _handle_audio,
+        "_code": _handle_code,
         "search_audio": _handle_search_audio,
     }
 
