@@ -1,6 +1,8 @@
 import contextlib
+import html
 import os
 import pathlib
+import re
 import shutil
 import time
 import traceback
@@ -8,7 +10,6 @@ import asyncio
 import httpx
 import importlib
 
-from telethon import types
 from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
 from pagermaid.enums import Message, AsyncClient
@@ -48,6 +49,155 @@ base_opts = {
     "addmetadata": True,
     "noplaylist": True,
 }
+
+SEARCH_CACHE_KEY = "custom.ytdl_search_cache"
+SEARCH_RESULT_LIMIT = 5
+SEARCH_CACHE_TTL_SECONDS = 10 * 60
+MUSIC_POSITIVE_TERMS = ("official", "官方")
+MUSIC_NEGATIVE_TERMS = ("live", "cover", "remix", "dj", "舞蹈", "dance", "伴奏")
+MUSIC_MAX_DURATION_SECONDS = 10 * 60
+
+
+def _looks_like_url(value: str) -> bool:
+    value = value.strip()
+    if re.match(r"^(https?://|www\.)", value, re.I):
+        return True
+    return bool(re.match(r"^[A-Za-z0-9-]+\.[A-Za-z]{2,}([/:?].*)?$", value))
+
+
+def _format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "--:--"
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{sec:02d}"
+    return f"{minutes}:{sec:02d}"
+
+
+def _music_result_score(item: dict) -> int:
+    raw_title = item.get("title", "")
+    raw_channel = item.get("channel", "")
+    title = raw_title.lower()
+    channel = raw_channel.lower()
+    duration = item.get("duration") or 0
+    score = 0
+    if any(term in title or term in channel for term in MUSIC_POSITIVE_TERMS if term.isascii()) or any(
+        term in raw_title or term in raw_channel for term in MUSIC_POSITIVE_TERMS if not term.isascii()
+    ):
+        score += 6
+    for term in MUSIC_NEGATIVE_TERMS:
+        if term in title or term in channel:
+            score -= 4
+    if duration and duration > MUSIC_MAX_DURATION_SECONDS:
+        score -= 8
+    if duration and duration > 15 * 60:
+        score -= 16
+    return score
+
+
+def _ytdl_search(
+    keyword: str,
+    limit: int = SEARCH_RESULT_LIMIT,
+    music_only: bool = False,
+) -> list[dict]:
+    opts = {
+        **base_opts,
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit * 3}:{keyword}", download=False)
+
+    results = []
+    for entry in info.get("entries", []) or []:
+        url = entry.get("webpage_url") or entry.get("url")
+        if url and not _looks_like_url(url):
+            url = f"https://www.youtube.com/watch?v={url}"
+        results.append(
+            {
+                "title": entry.get("title") or "N/A",
+                "url": url,
+                "duration": entry.get("duration"),
+                "channel": entry.get("channel") or entry.get("uploader") or "Unknown",
+            }
+        )
+    results = [item for item in results if item.get("url")]
+    if music_only:
+        results.sort(
+            key=lambda item: (
+                -_music_result_score(item),
+                (item.get("duration") or 0) > MUSIC_MAX_DURATION_SECONDS,
+                item.get("duration") is None,
+                abs((item.get("duration") or 0) - 240) if item.get("duration") else 9999,
+            )
+        )
+    return results[:limit]
+
+
+def _format_search_results(keyword: str, results: list[dict], is_audio: bool) -> str:
+    lines = [
+        f"搜索结果: <code>{html.escape(keyword)}</code>",
+        "",
+    ]
+    for idx, item in enumerate(results, start=1):
+        lines.append(
+            f"{idx}. <a href=\"{html.escape(item['url'], quote=True)}\">{html.escape(item['title'])}</a>"
+        )
+        lines.append(
+            f"   时长: <code>{_format_duration(item.get('duration'))}</code> | 频道: <code>{html.escape(item['channel'])}</code>"
+        )
+    lines.extend(
+        [
+            "",
+            "发送 <code>ytdl 序号</code> 下载视频",
+            "发送 <code>ytdl m 序号</code> 下载音频",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _get_search_cache() -> dict:
+    data = db.get(SEARCH_CACHE_KEY, {})
+    if not isinstance(data, dict):
+        return {}
+
+    now = int(time.time())
+    cleaned = {
+        key: value
+        for key, value in data.items()
+        if isinstance(value, dict)
+        and now - int(value.get("updated_at", 0)) <= SEARCH_CACHE_TTL_SECONDS
+    }
+    if cleaned != data:
+        db[SEARCH_CACHE_KEY] = cleaned
+    return cleaned
+
+
+def _save_search_cache(data: dict) -> None:
+    db[SEARCH_CACHE_KEY] = data
+
+
+async def _resolve_cached_result(message: Message, target: str) -> str | None:
+    if not target.isdigit():
+        return None
+
+    cache = _get_search_cache()
+    results = cache.get(str(message.chat_id), {}).get("results", [])
+
+    index = int(target) - 1
+    if not results:
+        await message.edit("当前会话没有可用的搜索缓存，请先使用关键词搜索。")
+        return ""
+    if index < 0 or index >= len(results):
+        await message.edit(f"序号超出范围，请输入 1 到 {len(results)}。")
+        return ""
+    return results[index]["url"]
+
+
+def _should_use_cached_index(target: str, cache: dict, chat_id: int) -> bool:
+    return target.isdigit() and bool(cache.get(str(chat_id), {}).get("results"))
 
 
 def ydv_opts(url: str) -> dict:
@@ -147,7 +297,7 @@ def _ytdl_download(url: str, message: Message, loop, opts: dict, file_type_zh: s
         raise e
 
 
-async def ytdl_common(message: Message, file_type: str, proxy: str = None):
+async def ytdl_common(message: Message, file_type: str, proxy: str = None, url: str = None):
     if not shutil.which("ffmpeg"):
         return await message.edit(
             "本插件需要 `ffmpeg` 才能正常工作，请先安装 `ffmpeg`。", parse_mode="md",
@@ -163,7 +313,7 @@ async def ytdl_common(message: Message, file_type: str, proxy: str = None):
         shutil.rmtree(download_path)
     download_path.mkdir(parents=True, exist_ok=True)
 
-    url = message.arguments
+    url = url or message.arguments
     if file_type == "audio":
         opts = ydm_opts.copy()
         file_type_zh = "音频"
@@ -267,9 +417,13 @@ async def ytdl_common(message: Message, file_type: str, proxy: str = None):
 
 ytdl_help = (
     "**Youtube-dl**\n\n"
-    "使用方法: `ytdl [m] <链接/关键词> | _proxy [<url>] | _codec [<codec>] | update`\n\n"
-    " - `ytdl <链接/关键词>`: 下载视频 (默认)\n"
-    " - `ytdl m <链接/关键词>`: 下载音频\n"
+    "使用方法: `ytdl [m] <链接/关键词/序号> | _proxy [<url>] | _codec [<codec>] | update`\n\n"
+    " - `ytdl <链接>`: 下载视频 (默认)\n"
+    " - `ytdl <关键词>`: 搜索 youtube 并返回候选列表（缓存 10 分钟）\n"
+    " - `ytdl <序号>`: 下载上一次搜索结果中的对应视频\n"
+    " - `ytdl m <链接>`: 下载音频\n"
+    " - `ytdl m <关键词>`: 对搜索结果按音乐特征重排后返回候选列表（缓存 10 分钟）\n"
+    " - `ytdl m <序号>`: 下载上一次搜索结果中的对应音频\n"
     " - `ytdl _proxy <url>`: 设置 HTTP/SOCKS 代理\n"
     " - `ytdl _proxy`: 删除代理\n"
     " - `ytdl _codec <codec>`: 设置优先选择的 Youtube 视频编码 (默认 avc1, 可选 vp9/av01)\n"
@@ -281,13 +435,17 @@ ytdl_help = (
 @listener(
     command="ytdl",
     description="从各种网站下载视频或音频。\n\n" + ytdl_help,
-    parameters="[m] <链接/关键词> | _proxy [<url>] | _codec [<codec>] | update",
+    parameters="[m] <链接/关键词/序号> | _proxy [<url>] | _codec [<codec>] | update",
 )
 async def ytdl(message: Message, client: AsyncClient):
     """
     Downloads videos or audio from various sites.
-    - `ytdl <url/keyword>`: download video
-    - `ytdl m <url/keyword>`: download audio
+    - `ytdl <url>`: download video
+    - `ytdl <keyword>`: search youtube and list candidates
+    - `ytdl <index>`: download from cached search results
+    - `ytdl m <url>`: download audio
+    - `ytdl m <keyword>`: rank candidates with music-oriented heuristics
+    - `ytdl m <index>`: download audio from cached search results
     - `ytdl _proxy <url>`: set HTTP/SOCKS proxy
     - `ytdl _proxy`: delete proxy
     - `ytdl _codec <codec>`: set preferred video codec
@@ -333,11 +491,49 @@ async def ytdl(message: Message, client: AsyncClient):
     if is_audio:
         if len(parts) < 2 or not parts[1].strip():
             return await message.edit(ytdl_help, parse_mode="markdown")
-        message.arguments = parts[1]
+        target = parts[1].strip()
         file_type = "audio"
     else:
-        message.arguments = arguments
+        target = arguments.strip()
         file_type = "video"
+
+    cache = _get_search_cache()
+    cache_key = str(message.chat_id)
+
+    if _should_use_cached_index(target, cache, message.chat_id):
+        resolved_url = await _resolve_cached_result(message, target)
+        if resolved_url == "":
+            return
+        if resolved_url is None:
+            return await message.edit("请输入链接、关键词，或使用 `ytdl 序号` 选择结果。", parse_mode="markdown")
+        message.arguments = resolved_url
+    elif _looks_like_url(target):
+        message.arguments = target
+    else:
+        try:
+            await message.edit("🔎 正在搜索候选结果...")
+            results = await bot.loop.run_in_executor(
+                None, _ytdl_search, target, SEARCH_RESULT_LIMIT, is_audio
+            )
+        except Exception:
+            return await message.edit(
+                f"搜索失败，发生错误：\n<code>{traceback.format_exc()}</code>",
+                parse_mode="html",
+            )
+        if not results:
+            return await message.edit("没有找到可用结果。")
+        cache[cache_key] = {
+            "keyword": target,
+            "results": results,
+            "updated_at": int(time.time()),
+        }
+        _save_search_cache(cache)
+        await message.edit(
+            _format_search_results(target, results, is_audio),
+            parse_mode="html",
+            link_preview=False,
+        )
+        return
 
     proxy = db.get("custom.ytdl_proxy")
     await ytdl_common(message, file_type, proxy)
