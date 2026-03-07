@@ -75,6 +75,7 @@ class Config:
     DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
     DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
     DEFAULT_TTS_VOICE = "Laomedeia"
+    DEFAULT_API_TIMEOUT = 300
 
 
 # --- Telegraph Functions ---
@@ -241,6 +242,18 @@ def _get_utf16_length(text: str) -> int:
     return len(text.encode('utf-16-le')) // 2
 
 
+def _get_response_parts(response) -> list:
+    """Safely extracts candidate content parts from a Gemini response."""
+    try:
+        candidates = getattr(response, 'candidates', None) or []
+        if not candidates:
+            return []
+        content = getattr(candidates[0], 'content', None)
+        return getattr(content, 'parts', None) or []
+    except (IndexError, AttributeError, TypeError):
+        return []
+
+
 def _remove_gemini_footer(text: str) -> str:
     """Removes the 'Powered by Gemini' footer from text."""
     lines = text.splitlines()
@@ -330,9 +343,8 @@ async def _get_gemini_client(message: Message) -> genai.Client | None:
 
 def _extract_response_text(response) -> str:
     """Extracts response text, skipping thought/reasoning parts from thinking models."""
-    try:
-        parts = response.candidates[0].content.parts
-    except (IndexError, AttributeError):
+    parts = _get_response_parts(response)
+    if not parts:
         return response.text or ""
 
     text_segments = [part.text for part in parts if not getattr(part, 'thought', False) and part.text]
@@ -485,9 +497,8 @@ def _normalize_block_spacing_in_html(html_output: str) -> str:
 
 def _extract_code_response_text(response) -> str:
     """Formats code execution responses, including generated code and runtime output."""
-    try:
-        parts = response.candidates[0].content.parts
-    except (IndexError, AttributeError):
+    parts = _get_response_parts(response)
+    if not parts:
         return response.text or ""
 
     rendered_parts = []
@@ -546,7 +557,10 @@ async def _call_gemini_api(message: Message, contents: list, use_search: bool,
 
     try:
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, blocking_api_call)
+        response = await asyncio.wait_for(
+            loop.run_in_executor(None, blocking_api_call),
+            timeout=Config.DEFAULT_API_TIMEOUT
+        )
 
         sources = _extract_search_sources(response) if use_search else []
         if use_code:
@@ -562,6 +576,13 @@ async def _call_gemini_api(message: Message, contents: list, use_search: bool,
             history.extend([contents[0], plain_text])
             db[Config.CHAT_HISTORY] = history
         return plain_text, cited_text, sources
+    except asyncio.TimeoutError:
+        await message.edit(
+            f"<b>调用 Gemini API 超时。</b> 已等待 {Config.DEFAULT_API_TIMEOUT} 秒，请稍后重试。",
+            parse_mode='html'
+        )
+        await log(f"调用 Gemini API 超时: use_search={use_search}, use_code={use_code}")
+        return "", "", []
     except Exception as e:
         await _handle_gemini_exception(message, e)
         return "", "", []
@@ -580,17 +601,27 @@ async def _call_gemini_image_api(message: Message, contents: list) -> tuple[str 
 
     try:
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, blocking_image_call)
+        response = await asyncio.wait_for(
+            loop.run_in_executor(None, blocking_image_call),
+            timeout=Config.DEFAULT_API_TIMEOUT
+        )
         text_response, image_response = None, None
-        for part in response.candidates[0].content.parts:
+        for part in _get_response_parts(response):
             # Skip thinking/reasoning parts from thinking-capable models
             if getattr(part, 'thought', False):
                 continue
-            if part.text:
+            if getattr(part, 'text', None):
                 text_response = part.text
-            elif part.inline_data:
+            elif getattr(part, 'inline_data', None) and getattr(part.inline_data, 'data', None):
                 image_response = Image.open(io.BytesIO(part.inline_data.data))
         return text_response, image_response
+    except asyncio.TimeoutError:
+        await message.edit(
+            f"<b>调用 Gemini Image API 超时。</b> 已等待 {Config.DEFAULT_API_TIMEOUT} 秒，请稍后重试。",
+            parse_mode='html'
+        )
+        await log("调用 Gemini Image API 超时")
+        return None, None
     except Exception as e:
         await _handle_gemini_exception(message, e)
         return None, None
@@ -1183,6 +1214,7 @@ async def _execute_gemini_request(message: Message, args: str, use_search: bool,
 
     plain_text, cited_text, sources = await _call_gemini_api(message, contents, use_search=use_search, use_code=use_code)
     if not plain_text:
+        await _show_error(message, "模型未返回可显示的文本结果。")
         return
 
     output_text = cited_text if use_search else plain_text
@@ -1346,6 +1378,7 @@ async def _execute_audio_request(message: Message, args: str, use_search: bool):
 
     plain_text, cited_text, sources = await _call_gemini_api(message, contents, use_search=use_search)
     if not plain_text:
+        await _show_error(message, "模型未返回可显示的文本结果。")
         return
 
     fallback_text = cited_text if use_search else plain_text
