@@ -3,9 +3,10 @@
 Google Gemini AI 插件。需要 PagerMaid-Modify 1.5.8 及以上版本。
 
 核心功能:
-- `gemini [query]`: 与模型聊天 (默认)。
+- `gemini [query]`: 与模型聊天 (默认)，自动读取消息中的 URL 内容。
+- `gemini _code [query]`: 启用 Gemini 代码执行器处理问题，并展示生成代码与执行输出。
 - `gemini _audio [query]`: 获取模型回复并转换为语音。
-- `gemini search [query]`: 使用 Gemini AI 支持的 Google 搜索。
+- `gemini search [query]`: 使用 Gemini AI 支持的 Google 搜索，并在文本回复中追加引用序号和来源列表。
 - `gemini search_audio [query]`: 获取搜索结果并转换为语音。
 - `gemini tts [text]`: 将文本转换为语音。需要安装 ffmpeg。
 - `gemini image [prompt]`: 生成或编辑图片。
@@ -21,6 +22,7 @@ Google Gemini AI 插件。需要 PagerMaid-Modify 1.5.8 及以上版本。
 模型管理:
 - `gemini model list`: 列出可用模型。
 - `gemini model set [chat|search|image|tts] [name]`: 设置聊天、搜索、图片或 TTS 模型。
+- `chat` 模型同时用于默认聊天和 `_code` 子命令。
 
 提示词管理:
 - `gemini prompt list`: 列出所有已保存的系统提示。
