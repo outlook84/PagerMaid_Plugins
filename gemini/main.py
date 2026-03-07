@@ -344,6 +344,27 @@ def _normalize_text_for_match(text: str) -> str:
     return re.sub(r'\s+', ' ', text or '').strip()
 
 
+def _split_text_for_citation_matching(text: str) -> list[str]:
+    """Splits text into citation units with a fallback for single-line formatted output."""
+    lines = text.splitlines()
+    has_blank_separator = any(not line.strip() for line in lines)
+
+    if has_blank_separator:
+        paragraphs = []
+        current_lines = []
+        for line in lines:
+            if line.strip():
+                current_lines.append(line)
+            elif current_lines:
+                paragraphs.append("\n".join(current_lines).strip())
+                current_lines = []
+        if current_lines:
+            paragraphs.append("\n".join(current_lines).strip())
+        return paragraphs
+
+    return [line.strip() for line in lines if line.strip()]
+
+
 def _extract_search_sources(response) -> list[dict]:
     """Extracts deduplicated source entries from Gemini grounding metadata."""
     try:
@@ -392,7 +413,7 @@ def _annotate_search_text_with_supports(text: str, response, sources: list[dict]
         url = getattr(web, 'uri', None) or getattr(chunk, 'uri', None)
         chunk_source_numbers.append(source_index_by_url.get(url))
 
-    paragraphs = text.split("\n\n")
+    paragraphs = _split_text_for_citation_matching(text)
     paragraph_infos = []
     for paragraph in paragraphs:
         paragraph_infos.append({
