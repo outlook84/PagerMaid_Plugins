@@ -7,8 +7,10 @@ import asyncio
 import importlib.metadata
 import json
 import mimetypes
+import re
 
-from telethon import types
+from telethon import types, utils
+from telethon.tl import functions
 from PIL import Image
 
 from pagermaid.enums import Message, AsyncClient
@@ -37,6 +39,7 @@ except ImportError:
     fast_upload = None
 
 gallery_dl_is_downloading = False
+URL_RE = re.compile(r"(https?://[^\s<>\"]+|www\.[^\s<>\"]+)", re.IGNORECASE)
 
 
 async def get_video_metadata(file_path: pathlib.Path) -> (int, int, int, pathlib.Path):
@@ -102,6 +105,61 @@ def _parse_author(author_val):
     return str(author_val)
 
 
+def _extract_first_url(text: str) -> str | None:
+    """Returns the first URL-like token from text."""
+    if not text:
+        return None
+    match = URL_RE.search(text)
+    if not match:
+        return None
+    url = match.group(1).rstrip(".,!?:;)")
+    if url.startswith("www."):
+        url = f"https://{url}"
+    return url
+
+
+def _extract_entity_url(reply) -> str | None:
+    """Returns the first URL found in Telegram message entities."""
+    text = (
+        getattr(reply, "message", None)
+        or getattr(reply, "raw_text", None)
+        or getattr(reply, "text", None)
+        or ""
+    )
+    entities = getattr(reply, "entities", None) or []
+    for entity in entities:
+        if getattr(entity, "url", None):
+            return entity.url
+        if isinstance(entity, types.MessageEntityUrl):
+            start = getattr(entity, "offset", 0)
+            end = start + getattr(entity, "length", 0)
+            if url := _extract_first_url(text[start:end]):
+                return url
+    return None
+
+
+async def _resolve_input_url(message: Message, arguments: str) -> str | None:
+    """Resolves a URL from direct arguments or the replied message."""
+    if arguments and arguments.strip():
+        return arguments.strip()
+    if not getattr(message, "reply_to_msg_id", None):
+        return None
+    reply = await message.get_reply_message()
+    if not reply:
+        return None
+    if url := _extract_entity_url(reply):
+        return url
+    candidates = [
+        getattr(reply, "message", None),
+        getattr(reply, "raw_text", None),
+        getattr(reply, "text", None),
+    ]
+    for candidate in candidates:
+        if url := _extract_first_url(candidate or ""):
+            return url
+    return None
+
+
 def _extract_metadata(download_path: pathlib.Path, default_url: str) -> dict:
     """Extracts metadata from gallery-dl JSON files."""
     metadata = {
@@ -131,9 +189,11 @@ def _extract_metadata(download_path: pathlib.Path, default_url: str) -> dict:
     return metadata
 
 
-def _build_caption(metadata: dict) -> str:
+def _build_caption(metadata: dict, nsfw: bool = False) -> str:
     """Builds a caption from extracted metadata."""
     parts = []
+    if nsfw:
+        parts.append("#NSFW")
     if metadata.get("keyword"):
         parts.append(f"<b>Keyword:</b> {metadata['keyword']}")
     elif metadata.get("title") and metadata["title"] != "N/A":
@@ -212,7 +272,7 @@ async def _run_gallery_dl(url: str, download_path: pathlib.Path, proxy: str = No
     return await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
 
-async def _upload_files(message: Message, files: list[pathlib.Path], caption: str):
+async def _upload_files(message: Message, files: list[pathlib.Path], caption: str, spoiler: bool = False):
     """Separates files into media and others, then uploads them."""
     reply_to = message.reply_to_msg_id or None
     media_files, other_files, thumbs_to_clean = [], [], []
@@ -223,47 +283,125 @@ async def _upload_files(message: Message, files: list[pathlib.Path], caption: st
         else:
             other_files.append(p)
 
-    async def upload_file(file_path):
-        return (await fast_upload(bot, str(file_path)), None) if fast_upload else (file_path, None)
+    async def upload_file(file_path, raw: bool = False):
+        if fast_upload and not raw:
+            return await fast_upload(bot, str(file_path)), None
+        return await bot.upload_file(file_path), None
+
+    async def parse_caption(text: str):
+        if not text:
+            return "", []
+        parser = getattr(bot, "_parse_message_text", None)
+        if parser:
+            return await parser(text, "html")
+        return text, []
+
+    async def send_spoiler_media(file_path: pathlib.Path, text: str = ""):
+        entity = await bot.get_input_entity(message.chat_id)
+        media = await build_spoiler_input_media(file_path)
+        parsed_text, entities = await parse_caption(text)
+        await bot(functions.messages.SendMediaRequest(
+            peer=entity,
+            media=media,
+            reply_to=None if reply_to is None else types.InputReplyToMessage(reply_to),
+            message=parsed_text,
+            entities=entities or None,
+        ))
+
+    async def build_spoiler_input_media(file_path: pathlib.Path):
+        entity = await bot.get_input_entity(message.chat_id)
+        uploaded_file, _ = await upload_file(file_path, raw=True)
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        thumb, attributes = None, []
+        if mime_type.startswith("video/"):
+            width, height, duration, thumb_path = await get_video_metadata(file_path)
+            if thumb_path:
+                thumbs_to_clean.append(thumb_path)
+                thumb, _ = await upload_file(thumb_path, raw=True)
+            attributes.append(
+                types.DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)
+            )
+        if mime_type.startswith("image/"):
+            uploaded_media = types.InputMediaUploadedPhoto(file=uploaded_file, spoiler=True)
+            result = await bot(functions.messages.UploadMediaRequest(entity, media=uploaded_media))
+            media = utils.get_input_media(result.photo)
+            return types.InputMediaPhoto(id=media.id, spoiler=True)
+
+        uploaded_media = types.InputMediaUploadedDocument(
+            file=uploaded_file,
+            thumb=thumb,
+            mime_type=mime_type,
+            attributes=attributes,
+            spoiler=True,
+        )
+        result = await bot(functions.messages.UploadMediaRequest(entity, media=uploaded_media))
+        media = utils.get_input_media(result.document, supports_streaming=True)
+        return types.InputMediaDocument(id=media.id, spoiler=True)
+
+    async def send_spoiler_album(chunk_files: list[pathlib.Path], text: str = ""):
+        entity = await bot.get_input_entity(message.chat_id)
+        parsed_text, entities = await parse_caption(text)
+        single_media = []
+        for index, file_path in enumerate(chunk_files):
+            single_media.append(types.InputSingleMedia(
+                media=await build_spoiler_input_media(file_path),
+                message=parsed_text if index == 0 else "",
+                entities=entities if index == 0 and entities else None,
+            ))
+        await bot(functions.messages.SendMultiMediaRequest(
+            peer=entity,
+            multi_media=single_media,
+            reply_to=None if reply_to is None else types.InputReplyToMessage(reply_to),
+        ))
 
     if media_files:
-        album_files = []
-        for file_path in media_files:
-            if not fast_upload:
-                album_files.append(file_path)
-                continue
-            uploaded_file, _ = await upload_file(file_path)
-            thumb, attributes = None, []
-            if (mimetypes.guess_type(file_path.name)[0] or "").startswith("video/"):
-                width, height, duration, thumb_path = await get_video_metadata(file_path)
-                if thumb_path:
-                    thumbs_to_clean.append(thumb_path)
-                    thumb, _ = await upload_file(thumb_path)
-                attributes.append(
-                    types.DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True))
-            if (mimetypes.guess_type(file_path.name)[0] or "").startswith("image/"):
-                album_files.append(types.InputMediaUploadedPhoto(file=uploaded_file))
-            else:
-                album_files.append(types.InputMediaUploadedDocument(
-                    file=uploaded_file, thumb=thumb,
-                    mime_type=mimetypes.guess_type(file_path.name)[0] or "application/octet-stream",
-                    attributes=attributes
-                ))
-        for i in range(0, len(album_files), 10):
-            chunk = album_files[i:i + 10]
-            await bot.send_file(
-                message.chat_id, chunk, reply_to=reply_to, parse_mode="html",
-                caption=caption if len(album_files) <= 10 else f"<b>#{i // 10 + 1}</b>\n{caption}"
-            )
-            await asyncio.sleep(1)
+        if spoiler:
+            for i in range(0, len(media_files), 10):
+                chunk_files = media_files[i:i + 10]
+                current_caption = caption if len(media_files) <= 10 else f"<b>#{i // 10 + 1}</b>\n{caption}"
+                await send_spoiler_album(chunk_files, current_caption)
+                await asyncio.sleep(1)
+        else:
+            album_files = []
+            for file_path in media_files:
+                if not fast_upload:
+                    album_files.append(file_path)
+                    continue
+                uploaded_file, _ = await upload_file(file_path)
+                thumb, attributes = None, []
+                if (mimetypes.guess_type(file_path.name)[0] or "").startswith("video/"):
+                    width, height, duration, thumb_path = await get_video_metadata(file_path)
+                    if thumb_path:
+                        thumbs_to_clean.append(thumb_path)
+                        thumb, _ = await upload_file(thumb_path)
+                    attributes.append(
+                        types.DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True))
+                if (mimetypes.guess_type(file_path.name)[0] or "").startswith("image/"):
+                    album_files.append(types.InputMediaUploadedPhoto(file=uploaded_file))
+                else:
+                    album_files.append(types.InputMediaUploadedDocument(
+                        file=uploaded_file, thumb=thumb,
+                        mime_type=mimetypes.guess_type(file_path.name)[0] or "application/octet-stream",
+                        attributes=attributes
+                    ))
+            for i in range(0, len(album_files), 10):
+                chunk = album_files[i:i + 10]
+                await bot.send_file(
+                    message.chat_id, chunk, reply_to=reply_to, parse_mode="html",
+                    caption=caption if len(album_files) <= 10 else f"<b>#{i // 10 + 1}</b>\n{caption}",
+                )
+                await asyncio.sleep(1)
 
     if other_files:
         for i, file_path in enumerate(other_files):
-            uploaded_file, _ = await upload_file(file_path)
-            await bot.send_file(
-                message.chat_id, uploaded_file, force_document=True, reply_to=reply_to,
-                caption=caption if not media_files and i == 0 else "", parse_mode="html"
-            )
+            if spoiler:
+                await send_spoiler_media(file_path, caption if not media_files and i == 0 else "")
+            else:
+                uploaded_file, _ = await upload_file(file_path)
+                await bot.send_file(
+                    message.chat_id, uploaded_file, force_document=True, reply_to=reply_to,
+                    caption=caption if not media_files and i == 0 else "", parse_mode="html",
+                )
             await asyncio.sleep(1)
 
     for thumb in thumbs_to_clean:
@@ -271,7 +409,13 @@ async def _upload_files(message: Message, files: list[pathlib.Path], caption: st
             os.remove(thumb)
 
 
-async def gallery_dl_common(message: Message, proxy: str = None, extra_args: list = None, keyword: str = None):
+async def gallery_dl_common(
+    message: Message,
+    proxy: str = None,
+    extra_args: list = None,
+    keyword: str = None,
+    spoiler: bool = False,
+):
     global gallery_dl_is_downloading
     if gallery_dl_is_downloading:
         return await message.edit("有一个下载任务正在运行中，请不要重复使用命令。" )
@@ -297,8 +441,8 @@ async def gallery_dl_common(message: Message, proxy: str = None, extra_args: lis
         metadata = _extract_metadata(download_path, url)
         if keyword:
             metadata["keyword"] = keyword
-        caption = _build_caption(metadata)
-        await _upload_files(message, processed_files, caption)
+        caption = _build_caption(metadata, nsfw=spoiler)
+        await _upload_files(message, processed_files, caption, spoiler=spoiler)
         await message.delete()
     except Exception:
         await message.edit(f"下载/发送文件失败，发生错误：\n<code>{traceback.format_exc()}</code>", parse_mode="html")
@@ -310,18 +454,21 @@ async def gallery_dl_common(message: Message, proxy: str = None, extra_args: lis
 @listener(
     command="gdl",
     description="从各种网站下载图片/视频。",
-    parameters="<链接> | _proxy [<proxy_url>] | update | _pixiv <关键字>",
+    parameters="<链接> | _nsfw <链接> | _proxy [<proxy_url>] | update | _pixiv [_nsfw] <关键字>",
 )
 async def gallery_dl_main(message: Message, client: AsyncClient):
     """
     Downloads image/video galleries from various sites.
     - `gdl <url>`: download gallery
+    - `gdl _nsfw <url>`: download gallery as spoiler media with #NSFW tag
     - `gdl _proxy <proxy_url>`: set HTTP/SOCKS proxy
     - `gdl _proxy`: delete proxy
     - `gdl update`: update gallery-dl
     - `gdl _pixiv <keyword>`: download popular illustrations from pixiv by keyword
+    - `gdl _pixiv _nsfw <keyword>`: same as above, but mark media as spoiler
     """
-    arguments = message.arguments
+    arguments = (message.arguments or "").strip()
+    spoiler = False
     if arguments.startswith("_proxy"):
         parts = arguments.split(" ", 1)
         if len(parts) > 1 and parts[1]:
@@ -339,24 +486,52 @@ async def gallery_dl_main(message: Message, client: AsyncClient):
         await gallery_dl_update(message, client)
         return
 
+    if arguments.startswith("_nsfw"):
+        parts = arguments.split(" ", 1)
+        spoiler = True
+        arguments = parts[1].strip() if len(parts) > 1 else ""
+        resolved_url = await _resolve_input_url(message, arguments)
+        if not resolved_url:
+            return await message.edit("请提供要下载的链接，或回复一条带链接的消息。")
+        arguments = resolved_url
+        message.arguments = arguments
+
     if arguments.startswith("_pixiv"):
         parts = arguments.split(" ", 1)
         if len(parts) > 1 and parts[1]:
-            keyword = parts[1]
+            keyword = parts[1].strip()
+            if keyword.startswith("_nsfw"):
+                spoiler_parts = keyword.split(" ", 1)
+                if len(spoiler_parts) == 1 or not spoiler_parts[1].strip():
+                    return await message.edit("请提供 Pixiv 搜索关键字。")
+                spoiler = True
+                keyword = spoiler_parts[1].strip()
             url = f'https://www.pixiv.net/tags/{keyword}/popular'
             message.arguments = url
             proxy = db.get("custom.gdl_proxy")
-            await gallery_dl_common(message, proxy, extra_args=["--range", "1-10"], keyword=keyword)
+            await gallery_dl_common(
+                message, proxy, extra_args=["--range", "1-10"], keyword=keyword, spoiler=spoiler
+            )
         else:
             await message.edit("请提供 Pixiv 搜索关键字。" )
         return
 
     if not arguments:
+        resolved_url = await _resolve_input_url(message, arguments)
+        if resolved_url:
+            message.arguments = resolved_url
+            proxy = db.get("custom.gdl_proxy")
+            await gallery_dl_common(message, proxy, spoiler=spoiler)
+            return
         return await message.edit(
             "**gdl**\n\n"
-            "使用方法: `gdl <链接> | _proxy [<url>] | update | _pixiv <关键字>`\n\n"
+            "使用方法: `gdl <链接> | _nsfw <链接> | _proxy [<url>] | update | _pixiv [_nsfw] <关键字>`\n\n"
             " - `gdl <链接>`: 下载图片/视频\n"
+            " - `gdl` + 回复含链接消息: 自动读取被回复消息中的链接\n"
+            " - `gdl _nsfw <链接>`: 以 spoiler 遮罩发送媒体，并在文本顶部增加 `#NSFW`\n"
+            " - `gdl _nsfw` + 回复含链接消息: 自动读取被回复消息中的链接并启用 spoiler\n"
             " - `gdl _pixiv <关键字>`: 下载 pixiv 热门插画\n"
+            " - `gdl _pixiv _nsfw <关键字>`: 下载 pixiv 热门插画，并启用 spoiler/`#NSFW`\n"
             " - `gdl _proxy <url>`: 设置 HTTP/SOCKS 代理\n"
             " - `gdl _proxy`: 删除代理\n"
             " - `gdl update`: 更新 gallery-dl\n",
@@ -365,7 +540,8 @@ async def gallery_dl_main(message: Message, client: AsyncClient):
         )
 
     proxy = db.get("custom.gdl_proxy")
-    await gallery_dl_common(message, proxy)
+    message.arguments = arguments
+    await gallery_dl_common(message, proxy, spoiler=spoiler)
 
 
 async def gallery_dl_update(message: Message, client: AsyncClient):
