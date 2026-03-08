@@ -126,6 +126,7 @@ def _extract_entity_url(reply) -> str | None:
         or getattr(reply, "text", None)
         or ""
     )
+    surrogate_text = utils.add_surrogate(text)
     entities = getattr(reply, "entities", None) or []
     for entity in entities:
         if getattr(entity, "url", None):
@@ -133,7 +134,8 @@ def _extract_entity_url(reply) -> str | None:
         if isinstance(entity, types.MessageEntityUrl):
             start = getattr(entity, "offset", 0)
             end = start + getattr(entity, "length", 0)
-            if url := _extract_first_url(text[start:end]):
+            entity_text = utils.del_surrogate(surrogate_text[start:end])
+            if url := _extract_first_url(entity_text):
                 return url
     return None
 
@@ -325,7 +327,8 @@ async def _upload_files(message: Message, files: list[pathlib.Path], caption: st
             uploaded_media = types.InputMediaUploadedPhoto(file=uploaded_file, spoiler=True)
             result = await bot(functions.messages.UploadMediaRequest(entity, media=uploaded_media))
             media = utils.get_input_media(result.photo)
-            return types.InputMediaPhoto(id=media.id, spoiler=True)
+            media.spoiler = True
+            return media
 
         uploaded_media = types.InputMediaUploadedDocument(
             file=uploaded_file,
@@ -336,7 +339,8 @@ async def _upload_files(message: Message, files: list[pathlib.Path], caption: st
         )
         result = await bot(functions.messages.UploadMediaRequest(entity, media=uploaded_media))
         media = utils.get_input_media(result.document, supports_streaming=True)
-        return types.InputMediaDocument(id=media.id, spoiler=True)
+        media.spoiler = True
+        return media
 
     async def send_spoiler_album(chunk_files: list[pathlib.Path], text: str = ""):
         entity = await bot.get_input_entity(message.chat_id)
