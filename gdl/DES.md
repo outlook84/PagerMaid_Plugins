@@ -9,7 +9,11 @@
 您可以通过以下命令使用本插件：
 
 - `gdl <链接>`: 下载指定的图片或视频库。
+- `gdl`: 回复一条包含链接的消息，自动读取被回复消息中的第一个链接。
+- `gdl _nsfw <链接>`: 以 spoiler 遮罩发送媒体，并在消息文本顶部增加 `#NSFW` 标签。
+- `gdl _nsfw`: 回复一条包含链接的消息，自动读取链接并启用 spoiler/`#NSFW`。
 - `gdl _pixiv <关键字>`: 下载 pixiv 热门插画。
+- `gdl _pixiv _nsfw <关键字>`: 下载 pixiv 热门插画，并启用 spoiler/`#NSFW`。
 - `gdl _proxy <url>`: 设置下载时使用的 HTTP/SOCKS 代理。
 - `gdl _proxy`: 删除已设置的代理。
 - `gdl update`: 检查并更新 `gallery-dl` 到最新版本。
