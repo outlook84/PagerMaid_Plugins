@@ -391,6 +391,16 @@
             "des": "## yt-dlp\n\n基于 `yt-dlp`，从 YouTube 等网站下载视频或音频。\n\n- `ytdl <链接/关键词>`: 下载视频 (默认)\n- `ytdl m <链接/关键词>`: 下载音频\n- `ytdl _proxy <url>`: 设置 HTTP/SOCKS 代理\n- `ytdl _proxy`: 删除代理\n- `ytdl _codec <codec>`: 设置优先选择的 YouTube 视频编码 (默认 avc1, 可选 vp9/av01)\n- `ytdl _codec`: 删除优先选择的 YouTube 视频编码\n- `ytdl update`: 更新 yt-dlp"
         },
         {
+            "name": "yvlu",
+            "version": "1.0",
+            "section": "chat",
+            "maintainer": "outlook84",
+            "size": "116.5 kb",
+            "supported": true,
+            "des_short": "将消息渲染为 Telegram 风格的语录贴纸。",
+            "des": "## yvlu\n\n将消息渲染为 Telegram 风格的语录贴纸，支持文字样式、回复预览、转发来源、图片/贴纸预览与自定义表情。\n\n核心用法:\n- `yvlu`: 回复一条消息生成语录贴纸。\n- `yvlu <数字>`: 回复一条消息后，向后合并指定条数的连续消息，一并生成语录贴纸。\n- `yvlu <文本>`: 直接将自己的文本生成语录贴纸。\n- `yvlu _fake <文本>`: 回复某条消息，沿用该消息发送者身份伪造一条语录贴纸。\n- `yvlu _day`: 使用浅色主题生成语录，可与回复模式或直接文本模式组合使用。\n\n样式与字体:\n- `yvlu _font <字体文件名>`: 使用放在 `data/yvlu/` 目录下的字体文件。\n- `yvlu _font reset`: 重置为默认字体。\n- `yvlu _size <倍率>`: 设置整体字体与布局倍率，支持如 `1.2` 或 `120%`。\n- `yvlu _size reset`: 重置倍率为默认值。\n\n贴纸包:\n- `yvlu _pack`: 查看当前设置的贴纸包名称。\n- `yvlu _pack <名称>`: 设置自动收录语录贴纸的贴纸包；若贴纸包不存在，会在后续添加时自动创建。\n- `yvlu _packadd`: 开关“生成后自动添加到贴纸包”。\n- 回复消息时使用 `yvlu _packadd`: 本次生成后强制添加到贴纸包。"
+        },
+        {
             "name": "bf",
             "version": "1.1",
             "section": "chat",
