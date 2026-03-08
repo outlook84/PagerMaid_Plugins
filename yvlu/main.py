@@ -1240,7 +1240,7 @@ async def _download_file_async(url: str, path: str, timeout: int = 20):
                     resp.raise_for_status()
                     with open(path, 'wb') as f:
                         async for chunk in resp.aiter_bytes():
-                            f.write(chunk)
+                            await asyncio.to_thread(f.write, chunk)
             return True
         except Exception:
             if exists(path):
@@ -1526,6 +1526,11 @@ def _build_utf16_index_map(text: str) -> Dict[int, int]:
         current_utf16_offset += len(char_val.encode('utf-16-le')) // 2
     utf16_to_str_idx[current_utf16_offset] = len(text)
     return utf16_to_str_idx
+
+
+def _utf16_length(text: str) -> int:
+    """Returns the length of a string in UTF-16 code units."""
+    return len(text.encode('utf-16-le')) // 2
 
 
 def _build_char_style_info(text: str, entities: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
@@ -1881,6 +1886,59 @@ def _draw_rich_text_lines(canvas: Image.Image, runtime: RichTextRuntime, lines: 
         current_y += runtime.line_height
 
 
+def _append_ellipsis_to_line(
+    line: List[_StyledWord],
+    runtime: RichTextRuntime,
+    token_render_width,
+) -> List[_StyledWord]:
+    """Shrinks the last visible line so an ellipsis fits within the width limit."""
+    ellipsis = _StyledWord('...', [])
+    available_width = runtime.max_width - max(2, int(runtime.font_size * RenderConfig.LINE_WRAP_MARGIN_FACTOR))
+    ellipsis_width = _word_render_width(ellipsis, token_render_width)
+    blockquote_extra_space = 0
+    if any('blockquote' in word.style for word in line):
+        quote_width = max(RenderConfig.QUOTE_LINE_MIN_WIDTH, int(runtime.font_size * RenderConfig.QUOTE_LINE_WIDTH_FACTOR))
+        quote_padding = max(RenderConfig.QUOTE_MIN_PADDING, int(runtime.font_size * RenderConfig.QUOTE_PADDING_FACTOR))
+        blockquote_extra_space = quote_width + quote_padding
+    allowed_line_width = max(ellipsis_width, available_width - blockquote_extra_space)
+
+    trimmed_line = [word for word in line if word.word != '\n']
+    while trimmed_line:
+        current_width = sum(_word_render_width(word, token_render_width) for word in trimmed_line)
+        if current_width + ellipsis_width <= allowed_line_width:
+            break
+        last_word = trimmed_line[-1]
+        if len(regex.findall(r'\X', last_word.word)) <= 1:
+            trimmed_line.pop()
+            continue
+        graphemes = regex.findall(r'\X', last_word.word)
+        shortened_word = _StyledWord(''.join(graphemes[:-1]), last_word.style, last_word.custom_emoji_id)
+        if shortened_word.word:
+            trimmed_line[-1] = shortened_word
+        else:
+            trimmed_line.pop()
+
+    trimmed_line.append(ellipsis)
+    return trimmed_line
+
+
+def _apply_max_height_to_lines(
+    lines: List[List[_StyledWord]],
+    runtime: RichTextRuntime,
+    token_render_width,
+    max_height: int | None,
+) -> List[List[_StyledWord]]:
+    """Limits wrapped lines to the requested height and adds an ellipsis when truncated."""
+    if max_height is None:
+        return lines
+    max_lines = max(1, max_height // runtime.line_height)
+    if len(lines) <= max_lines:
+        return lines
+    visible_lines = [list(line) for line in lines[:max_lines]]
+    visible_lines[-1] = _append_ellipsis_to_line(visible_lines[-1], runtime, token_render_width)
+    return visible_lines
+
+
 def _render_rich_text(
     text: str,
     entities: List[Dict[str, any]] | None,
@@ -1904,6 +1962,7 @@ def _render_rich_text(
     words = _build_styled_words(text, entities)
     token_render_width = _make_token_width_resolver(runtime)
     final_lines = _wrap_styled_words(words, runtime, token_render_width)
+    final_lines = _apply_max_height_to_lines(final_lines, runtime, token_render_width, max_height)
     metrics = _measure_rich_text_canvas(final_lines, runtime, token_render_width)
     img = Image.new('RGBA', (int(metrics.width + max(2, font_size // 8)), int(metrics.height)), (0, 0, 0, 0))
     _draw_rich_text_lines(img, runtime, final_lines, token_render_width)
@@ -2537,7 +2596,9 @@ async def _run_generator(**kwargs) -> Tuple[BytesIO, int]:
 
 def _extract_message_entities_after_prefix(message: Any) -> Tuple[List[Dict[str, Any]], int]:
     """Extracts message entities and shifts offsets to exclude the command prefix."""
-    prefix_units = len((getattr(message, 'raw_text', '') or '').split(' ', 1)[0]) + 1
+    raw_text = getattr(message, 'raw_text', '') or ''
+    prefix_text, sep, _ = raw_text.partition(' ')
+    prefix_units = _utf16_length(prefix_text + sep)
     full_entities = _telethon_entities_to_dicts(getattr(message, 'entities', None))
     adjusted_entities = [
         {**entity, 'offset': max(0, entity['offset'] - prefix_units)}
