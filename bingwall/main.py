@@ -22,7 +22,7 @@ async def get_wallpaper_url(num):
                 urls.append(f"https://www.bing.com{url_base}_{resolution}.jpg")
         if image.get("url"):
             urls.append(f"https://www.bing.com{image['url']}")
-        copy_right = image["copyright"]
+        copy_right = image.get("copyright", "")
     return urls, copy_right
 
 
