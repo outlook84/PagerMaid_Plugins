@@ -82,13 +82,13 @@
         },
         {
             "name": "bingwall",
-            "version": "1.04",
+            "version": "1.05",
             "section": "chat",
             "maintainer": "xtaodada、ahhhiiii",
-            "size": "2.151 kb",
+            "size": "2.127 kb",
             "supported": true,
             "des_short": "获取 Bing 每日壁纸。",
-            "des": "获取 Bing 每日壁纸。\n指令：,bingwall"
+            "des": "获取 Bing 每日壁纸。\n指令：`bingwall`\n带任意参数时以原图文件形式发送，例如：`bingwall 1`"
         },
         {
             "name": "calculator",
